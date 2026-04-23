@@ -6,6 +6,9 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+/// Stable identifier for a node in the tree.
+pub type NodeId = u32;
+
 /// Trait for tree data accessed top-down.
 ///
 /// Consumers implement this for their data structure. The widget calls these
@@ -15,31 +18,31 @@ pub trait TreeData {
     fn root_count(&self) -> usize;
 
     /// Node id of the root at the given index (0-based).
-    fn root(&self, index: usize) -> usize;
+    fn root(&self, index: usize) -> NodeId;
 
     /// Number of direct children of `node`.
-    fn child_count(&self, node: usize) -> usize;
+    fn child_count(&self, node: NodeId) -> usize;
 
     /// Node id of the child at `index` under `node`.
-    fn child(&self, node: usize, index: usize) -> usize;
+    fn child(&self, node: NodeId, index: usize) -> NodeId;
 
     /// Display label for the node.
-    fn node_label(&self, node: usize) -> &str;
+    fn node_label(&self, node: NodeId) -> &str;
 
     /// Optional icon string rendered before the label.
-    fn node_icon(&self, _node: usize) -> Option<&str> {
+    fn node_icon(&self, _node: NodeId) -> Option<&str> {
         None
     }
 
     /// Return the parent node id, if any. Returns `None` for root nodes.
-    fn parent(&self, node: usize) -> Option<usize>;
+    fn parent(&self, node: NodeId) -> Option<NodeId>;
 }
 
 /// A single row in the flattened visible-row list.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct VisibleRow {
     /// Node id in the tree data.
-    pub node_id: usize,
+    pub node_id: NodeId,
     /// Depth in the tree (0 for roots).
     pub depth: usize,
     /// Whether this node has children.
@@ -57,46 +60,70 @@ pub struct VisibleRow {
 /// Compute the flat list of visible rows by walking the tree top-down.
 ///
 /// Nodes whose parent is collapsed are excluded. The walk is depth-first.
-pub fn compute_visible_rows(data: &dyn TreeData, expanded: &BTreeSet<usize>) -> Vec<VisibleRow> {
-    let mut rows = Vec::new();
-    let root_count = data.root_count();
-    for i in 0..root_count {
-        let node = data.root(i);
-        let is_last = i == root_count - 1;
-        walk_node(data, expanded, node, 0, is_last, &[], &mut rows);
+#[must_use]
+pub fn compute_visible_rows(data: &dyn TreeData, expanded: &BTreeSet<NodeId>) -> Vec<VisibleRow> {
+    let mut walker = VisibleRowWalker::new(data, expanded);
+    let root_count = walker.data.root_count();
+    for index in 0..root_count {
+        let node = walker.data.root(index);
+        let is_last_sibling = index.saturating_add(1) == root_count;
+        walker.walk_node(node, 0, is_last_sibling, &[]);
     }
-    rows
+    walker.into_rows()
 }
 
-fn walk_node(
-    data: &dyn TreeData,
-    expanded: &BTreeSet<usize>,
-    node: usize,
-    depth: usize,
-    is_last_sibling: bool,
-    ancestors_last: &[bool],
-    rows: &mut Vec<VisibleRow>,
-) {
-    let child_count = data.child_count(node);
-    let has_children = child_count > 0;
-    let is_expanded = has_children && expanded.contains(&node);
+struct VisibleRowWalker<'a> {
+    data: &'a dyn TreeData,
+    expanded: &'a BTreeSet<NodeId>,
+    rows: Vec<VisibleRow>,
+}
 
-    rows.push(VisibleRow {
-        node_id: node,
-        depth,
-        has_children,
-        is_expanded,
-        is_last_sibling,
-        ancestors_last: ancestors_last.to_vec(),
-    });
+impl<'a> VisibleRowWalker<'a> {
+    fn new(data: &'a dyn TreeData, expanded: &'a BTreeSet<NodeId>) -> Self {
+        Self {
+            data,
+            expanded,
+            rows: Vec::new(),
+        }
+    }
 
-    if is_expanded {
-        let mut child_ancestors: Vec<bool> = ancestors_last.to_vec();
-        child_ancestors.push(is_last_sibling);
-        for ci in 0..child_count {
-            let child = data.child(node, ci);
-            let child_is_last = ci == child_count - 1;
-            walk_node(data, expanded, child, depth + 1, child_is_last, &child_ancestors, rows);
+    fn into_rows(self) -> Vec<VisibleRow> {
+        self.rows
+    }
+
+    fn walk_node(
+        &mut self,
+        node: NodeId,
+        depth: usize,
+        is_last_sibling: bool,
+        ancestors_last: &[bool],
+    ) {
+        let child_count = self.data.child_count(node);
+        let has_children = child_count > 0;
+        let is_expanded = has_children && self.expanded.contains(&node);
+
+        self.rows.push(VisibleRow {
+            node_id: node,
+            depth,
+            has_children,
+            is_expanded,
+            is_last_sibling,
+            ancestors_last: ancestors_last.to_vec(),
+        });
+
+        if is_expanded {
+            let mut child_ancestors = ancestors_last.to_vec();
+            child_ancestors.push(is_last_sibling);
+            for child_index in 0..child_count {
+                let child = self.data.child(node, child_index);
+                let is_child_last = child_index.saturating_add(1) == child_count;
+                self.walk_node(
+                    child,
+                    depth.saturating_add(1),
+                    is_child_last,
+                    &child_ancestors,
+                );
+            }
         }
     }
 }
@@ -107,10 +134,10 @@ fn walk_node(
 ///
 /// Stores children per node in a `BTreeMap` for deterministic order.
 pub struct SimpleTree {
-    roots: Vec<usize>,
-    children: BTreeMap<usize, Vec<usize>>,
-    parents: BTreeMap<usize, usize>,
-    labels: BTreeMap<usize, String>,
+    roots: Vec<NodeId>,
+    children: BTreeMap<NodeId, Vec<NodeId>>,
+    parents: BTreeMap<NodeId, NodeId>,
+    labels: BTreeMap<NodeId, String>,
 }
 
 impl SimpleTree {
@@ -118,18 +145,24 @@ impl SimpleTree {
     ///
     /// Entries with `parent_id = None` become roots. Children are ordered by
     /// their position in the input vec.
-    pub fn new(entries: Vec<(usize, Option<usize>, String)>) -> Self {
-        let mut roots = Vec::new();
-        let mut children: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
-        let mut parents = BTreeMap::new();
-        let mut labels = BTreeMap::new();
+    #[must_use]
+    pub fn new(entries: Vec<(NodeId, Option<NodeId>, String)>) -> Self {
+        let entry_count = entries.len();
+        let mut roots = Vec::with_capacity(entry_count);
+        let mut children: BTreeMap<NodeId, Vec<NodeId>> = BTreeMap::new();
+        let parents = entries
+            .iter()
+            .filter_map(|(id, parent_id, _label)| parent_id.map(|pid| (*id, pid)))
+            .collect();
+        let labels = entries
+            .iter()
+            .map(|(id, _parent_id, label)| (*id, label.clone()))
+            .collect();
 
-        for (id, parent_id, label) in entries {
-            labels.insert(id, label);
+        for (id, parent_id, _label) in entries {
             match parent_id {
                 Some(pid) => {
                     children.entry(pid).or_default().push(id);
-                    parents.insert(id, pid);
                 }
                 None => {
                     roots.push(id);
@@ -137,7 +170,12 @@ impl SimpleTree {
             }
         }
 
-        Self { roots, children, parents, labels }
+        Self {
+            roots,
+            children,
+            parents,
+            labels,
+        }
     }
 }
 
@@ -146,23 +184,23 @@ impl TreeData for SimpleTree {
         self.roots.len()
     }
 
-    fn root(&self, index: usize) -> usize {
+    fn root(&self, index: usize) -> NodeId {
         self.roots[index]
     }
 
-    fn child_count(&self, node: usize) -> usize {
-        self.children.get(&node).map(|v| v.len()).unwrap_or(0)
+    fn child_count(&self, node: NodeId) -> usize {
+        self.children.get(&node).map_or(0, Vec::len)
     }
 
-    fn child(&self, node: usize, index: usize) -> usize {
+    fn child(&self, node: NodeId, index: usize) -> NodeId {
         self.children[&node][index]
     }
 
-    fn node_label(&self, node: usize) -> &str {
+    fn node_label(&self, node: NodeId) -> &str {
         &self.labels[&node]
     }
 
-    fn parent(&self, node: usize) -> Option<usize> {
+    fn parent(&self, node: NodeId) -> Option<NodeId> {
         self.parents.get(&node).copied()
     }
 }
@@ -305,16 +343,13 @@ mod tests {
         let expanded_partial = BTreeSet::from([0, 2]);
         let rows_partial = compute_visible_rows(&tree, &expanded_partial);
         assert_eq!(rows_partial.len(), 4);
-        let ids: Vec<usize> = rows_partial.iter().map(|r| r.node_id).collect();
+        let ids: Vec<NodeId> = rows_partial.iter().map(|r| r.node_id).collect();
         assert_eq!(ids, vec![0, 1, 2, 5]);
     }
 
     #[test]
     fn visible_rows_multiple_roots() {
-        let tree = SimpleTree::new(vec![
-            (0, None, "r1".into()),
-            (1, None, "r2".into()),
-        ]);
+        let tree = SimpleTree::new(vec![(0, None, "r1".into()), (1, None, "r2".into())]);
         let rows = compute_visible_rows(&tree, &BTreeSet::new());
         assert_eq!(rows.len(), 2);
         assert!(!rows[0].is_last_sibling);

@@ -95,7 +95,9 @@ pub struct LeaderMenuItem<A> {
 /// A named menu level (root or submenu).
 #[derive(Debug, Clone)]
 pub struct LeaderMenuDef<A> {
+    /// Menu label shown in headings and breadcrumbs.
     pub label: String,
+    /// Items available at this menu level.
     pub items: Vec<LeaderMenuItem<A>>,
 }
 
@@ -127,6 +129,7 @@ pub struct MenuContribution<A> {
 
 /// Anything that contributes items to the leader menu.
 pub trait MenuContributor<A> {
+    /// Returns this contributor's menu items.
     fn menu_items(&self) -> Vec<MenuContribution<A>>;
 }
 
@@ -161,7 +164,7 @@ pub struct Conflict {
 ///
 /// Renderers convert platform-specific key events into this enum
 /// before calling [`LeaderMenu::handle_input`].
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MenuInput {
     /// A printable character (with or without Shift).
     Char(char),
@@ -200,31 +203,37 @@ impl<A> LeaderMenu<A> {
     }
 
     /// The root menu definition.
+    #[must_use]
     pub fn root_def(&self) -> &LeaderMenuDef<A> {
         &self.root
     }
 
     /// All submenu definitions.
+    #[must_use]
     pub fn submenu_defs(&self) -> &[LeaderMenuDef<A>] {
         &self.submenus
     }
 
-    /// The currently displayed menu level (None if menu is closed).
+    /// The currently displayed menu level, or `None` when the menu is closed.
+    #[must_use]
     pub fn current(&self) -> Option<&LeaderMenuDef<A>> {
         self.stack.last()
     }
 
     /// Breadcrumb trail for the title bar.
+    #[must_use]
     pub fn breadcrumb(&self) -> &[String] {
         &self.breadcrumb
     }
 
-    /// Current submenu depth (0 = root, 1 = first submenu, etc.).
-    pub fn depth(&self) -> usize {
-        self.stack.len().saturating_sub(1)
+    /// Current submenu depth (`0` = root, `1` = first submenu, etc.).
+    #[must_use]
+    pub fn depth(&self) -> u64 {
+        self.stack.len().saturating_sub(1) as u64
     }
 
-    /// Create from pre-built parts (public for platform wrappers and tests).
+    /// Creates a menu from pre-built parts for platform wrappers and tests.
+    #[must_use]
     pub fn test_from_parts(root: LeaderMenuDef<A>, submenus: Vec<LeaderMenuDef<A>>) -> Self {
         Self::from_parts(root, submenus)
     }
@@ -281,12 +290,9 @@ impl<A: Clone> LeaderMenu<A> {
     }
 
     fn handle_char_inner(&mut self, ch: char) -> Option<LeaderAction<A>> {
-        let current = match self.current() {
-            Some(m) => m,
-            None => {
-                self.close();
-                return None;
-            }
+        let Some(current) = self.current() else {
+            self.close();
+            return None;
         };
 
         if let Some(item) = current.items.iter().find(|i| i.key == ch) {
@@ -321,6 +327,11 @@ impl<A: Clone> LeaderMenu<A> {
 /// Result of building a leader menu: the menu and any conflicts.
 pub type BuildResult<A> = (LeaderMenu<A>, Vec<Conflict>);
 
+type GroupedMenuItems<A> = (
+    Vec<MenuContribution<A>>,
+    HashMap<String, Vec<MenuContribution<A>>>,
+);
+
 /// Build a leader menu from contributors.
 ///
 /// Collects all [`MenuContribution`] items, deduplicates by `(key, placement)`
@@ -334,18 +345,74 @@ pub fn build<A: Clone>(
     build_from_items(items, hidden)
 }
 
-/// Build from a pre-collected list of contributions.
+fn group_contributions<A>(
+    seen: HashMap<(char, MenuPlacement), MenuContribution<A>>,
+) -> GroupedMenuItems<A> {
+    let grouped_item_count = seen.len();
+    let mut root_items = Vec::with_capacity(grouped_item_count);
+    let mut submenu_items: HashMap<String, Vec<MenuContribution<A>>> =
+        HashMap::with_capacity(grouped_item_count);
+
+    for ((_, placement), item) in seen {
+        match placement {
+            MenuPlacement::Root => root_items.push(item),
+            MenuPlacement::Submenu(ref name) => {
+                submenu_items.entry(name.clone()).or_default().push(item);
+            }
+        }
+    }
+
+    debug_assert!(root_items.len() <= grouped_item_count);
+    debug_assert!(submenu_items.values().all(|items| !items.is_empty()));
+    (root_items, submenu_items)
+}
+
+fn menu_items_from_contributions<A>(items: Vec<MenuContribution<A>>) -> Vec<LeaderMenuItem<A>> {
+    items
+        .into_iter()
+        .map(|contribution| LeaderMenuItem {
+            key: contribution.key,
+            label: contribution.label,
+            action: contribution.action,
+        })
+        .collect()
+}
+
+fn build_submenus<A>(
+    submenu_items: HashMap<String, Vec<MenuContribution<A>>>,
+) -> Vec<LeaderMenuDef<A>> {
+    let mut submenus = Vec::with_capacity(submenu_items.len());
+    for (name, mut items) in submenu_items {
+        items.sort_by_key(|item| item.key);
+        submenus.push(LeaderMenuDef {
+            label: name,
+            items: menu_items_from_contributions(items),
+        });
+    }
+    submenus
+}
+
+/// Builds a leader menu from a pre-collected list of contributions.
+#[must_use]
 pub fn build_from_items<A: Clone>(
     mut all_items: Vec<MenuContribution<A>>,
     hidden: &HiddenSet,
 ) -> BuildResult<A> {
-    let mut conflicts = Vec::new();
+    let contribution_count = all_items.len();
+    let mut conflicts = Vec::with_capacity(contribution_count);
 
     // Sort by priority (lowest first so highest overwrites).
     all_items.sort_by_key(|i| i.priority);
+    debug_assert!(
+        all_items
+            .windows(2)
+            .all(|pair| pair[0].priority <= pair[1].priority)
+    );
+    debug_assert!(all_items.len() <= contribution_count);
 
     // Deduplicate by (key, placement) — last writer wins.
-    let mut seen: HashMap<(char, MenuPlacement), MenuContribution<A>> = HashMap::new();
+    let mut seen: HashMap<(char, MenuPlacement), MenuContribution<A>> =
+        HashMap::with_capacity(contribution_count);
     for item in all_items {
         let slot = (item.key, item.placement.clone());
         if let Some(existing) = seen.get(&slot) {
@@ -364,48 +431,14 @@ pub fn build_from_items<A: Clone>(
         seen.remove(h);
     }
 
-    // Group by placement.
-    let mut root_items: Vec<MenuContribution<A>> = Vec::new();
-    let mut submenu_items: HashMap<String, Vec<MenuContribution<A>>> = HashMap::new();
-
-    for ((_, placement), item) in seen {
-        match placement {
-            MenuPlacement::Root => root_items.push(item),
-            MenuPlacement::Submenu(ref name) => {
-                submenu_items.entry(name.clone()).or_default().push(item);
-            }
-        }
-    }
-
-    // Build submenu defs (sorted by key for stable ordering).
-    let mut submenus: Vec<LeaderMenuDef<A>> = Vec::new();
-    for (name, mut items) in submenu_items {
-        items.sort_by_key(|i| i.key);
-        submenus.push(LeaderMenuDef {
-            label: name,
-            items: items
-                .into_iter()
-                .map(|c| LeaderMenuItem {
-                    key: c.key,
-                    label: c.label,
-                    action: c.action,
-                })
-                .collect(),
-        });
-    }
+    let (mut root_items, submenu_items) = group_contributions(seen);
+    let submenus = build_submenus(submenu_items);
 
     // Build root def (sorted by key).
-    root_items.sort_by_key(|i| i.key);
+    root_items.sort_by_key(|item| item.key);
     let root = LeaderMenuDef {
         label: "Leader".into(),
-        items: root_items
-            .into_iter()
-            .map(|c| LeaderMenuItem {
-                key: c.key,
-                label: c.label,
-                action: c.action,
-            })
-            .collect(),
+        items: menu_items_from_contributions(root_items),
     };
 
     let menu = LeaderMenu::from_parts(root, submenus);
@@ -447,21 +480,23 @@ mod tests {
         }
     }
 
-    fn contrib_in(
+    struct ContributionSpec<'a> {
         key: char,
-        label: &str,
+        label: &'a str,
         action: LeaderAction<Act>,
         placement: MenuPlacement,
         priority: u16,
-        source: &str,
-    ) -> MenuContribution<Act> {
+        source: &'a str,
+    }
+
+    fn contrib_in(spec: ContributionSpec<'_>) -> MenuContribution<Act> {
         MenuContribution {
-            key,
-            label: label.into(),
-            action,
-            placement,
-            priority,
-            source: source.into(),
+            key: spec.key,
+            label: spec.label.into(),
+            action: spec.action,
+            placement: spec.placement,
+            priority: spec.priority,
+            source: spec.source.into(),
         }
     }
 
@@ -475,15 +510,29 @@ mod tests {
         let root = LeaderMenuDef {
             label: "Leader".into(),
             items: vec![
-                LeaderMenuItem { key: 's', label: "save".into(), action: LeaderAction::Action(Act::Save) },
-                LeaderMenuItem { key: 'o', label: "open".into(), action: LeaderAction::Action(Act::Open) },
-                LeaderMenuItem { key: 'x', label: "extra".into(), action: LeaderAction::Submenu("extra".into()) },
+                LeaderMenuItem {
+                    key: 's',
+                    label: "save".into(),
+                    action: LeaderAction::Action(Act::Save),
+                },
+                LeaderMenuItem {
+                    key: 'o',
+                    label: "open".into(),
+                    action: LeaderAction::Action(Act::Open),
+                },
+                LeaderMenuItem {
+                    key: 'x',
+                    label: "extra".into(),
+                    action: LeaderAction::Submenu("extra".into()),
+                },
             ],
         };
         let submenus = vec![LeaderMenuDef {
             label: "extra".into(),
             items: vec![LeaderMenuItem {
-                key: 'a', label: "alpha".into(), action: LeaderAction::Command("/alpha".into()),
+                key: 'a',
+                label: "alpha".into(),
+                action: LeaderAction::Command("/alpha".into()),
             }],
         }];
         LeaderMenu::from_parts(root, submenus)
@@ -605,16 +654,24 @@ mod tests {
     #[test]
     fn higher_priority_wins() {
         let lo = TestContributor {
-            items: vec![contrib_in(
-                'x', "lo", LeaderAction::Action(Act::Save),
-                MenuPlacement::Root, PRIORITY_BUILTIN, "builtin",
-            )],
+            items: vec![contrib_in(ContributionSpec {
+                key: 'x',
+                label: "lo",
+                action: LeaderAction::Action(Act::Save),
+                placement: MenuPlacement::Root,
+                priority: PRIORITY_BUILTIN,
+                source: "builtin",
+            })],
         };
         let hi = TestContributor {
-            items: vec![contrib_in(
-                'x', "hi", LeaderAction::Action(Act::Open),
-                MenuPlacement::Root, PRIORITY_PLUGIN, "plugin",
-            )],
+            items: vec![contrib_in(ContributionSpec {
+                key: 'x',
+                label: "hi",
+                action: LeaderAction::Action(Act::Open),
+                placement: MenuPlacement::Root,
+                priority: PRIORITY_PLUGIN,
+                source: "plugin",
+            })],
         };
         let (menu, conflicts) = build(&[&lo, &hi], &empty_hidden());
         assert_eq!(conflicts.len(), 1);
@@ -641,14 +698,22 @@ mod tests {
     fn submenu_auto_creation() {
         let c = TestContributor {
             items: vec![
-                contrib_in(
-                    'p', "plugins", LeaderAction::Submenu("plugins".into()),
-                    MenuPlacement::Root, PRIORITY_BUILTIN, "test",
-                ),
-                contrib_in(
-                    'c', "calendar", LeaderAction::Command("/cal".into()),
-                    MenuPlacement::Submenu("plugins".into()), PRIORITY_PLUGIN, "calendar",
-                ),
+                contrib_in(ContributionSpec {
+                    key: 'p',
+                    label: "plugins",
+                    action: LeaderAction::Submenu("plugins".into()),
+                    placement: MenuPlacement::Root,
+                    priority: PRIORITY_BUILTIN,
+                    source: "test",
+                }),
+                contrib_in(ContributionSpec {
+                    key: 'c',
+                    label: "calendar",
+                    action: LeaderAction::Command("/cal".into()),
+                    placement: MenuPlacement::Submenu("plugins".into()),
+                    priority: PRIORITY_PLUGIN,
+                    source: "calendar",
+                }),
             ],
         };
         let (menu, _) = build(&[&c], &empty_hidden());
@@ -663,14 +728,22 @@ mod tests {
     fn same_key_different_placement_no_conflict() {
         let c = TestContributor {
             items: vec![
-                contrib_in(
-                    'a', "root-a", LeaderAction::Action(Act::Save),
-                    MenuPlacement::Root, PRIORITY_BUILTIN, "test",
-                ),
-                contrib_in(
-                    'a', "sub-a", LeaderAction::Action(Act::Open),
-                    MenuPlacement::Submenu("foo".into()), PRIORITY_BUILTIN, "test",
-                ),
+                contrib_in(ContributionSpec {
+                    key: 'a',
+                    label: "root-a",
+                    action: LeaderAction::Action(Act::Save),
+                    placement: MenuPlacement::Root,
+                    priority: PRIORITY_BUILTIN,
+                    source: "test",
+                }),
+                contrib_in(ContributionSpec {
+                    key: 'a',
+                    label: "sub-a",
+                    action: LeaderAction::Action(Act::Open),
+                    placement: MenuPlacement::Submenu("foo".into()),
+                    priority: PRIORITY_BUILTIN,
+                    source: "test",
+                }),
             ],
         };
         let (_, conflicts) = build(&[&c], &empty_hidden());

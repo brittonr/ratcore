@@ -15,7 +15,10 @@ use std::collections::HashMap;
 
 /// A string key for stable node identity across rebuilds.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct NodeKey(pub String);
+pub struct NodeKey(
+    /// Stable node identity text.
+    pub String,
+);
 
 impl<S: Into<String>> From<S> for NodeKey {
     fn from(s: S) -> Self {
@@ -50,22 +53,30 @@ impl std::fmt::Debug for ViewNode {
 /// A flat list of view nodes representing the current inline content.
 #[derive(Debug, Default)]
 pub struct ViewTree {
+    /// Nodes in display order.
     pub nodes: Vec<ViewNode>,
 }
 
 impl ViewTree {
+    /// Creates an empty view tree.
+    #[must_use]
     pub fn new() -> Self {
         Self { nodes: Vec::new() }
     }
 
+    /// Appends a node to the end of the tree.
     pub fn push(&mut self, node: ViewNode) {
         self.nodes.push(node);
     }
 
-    pub fn len(&self) -> usize {
-        self.nodes.len()
+    /// Returns the number of nodes in the tree.
+    #[must_use]
+    pub fn len(&self) -> u64 {
+        self.nodes.len() as u64
     }
 
+    /// Returns `true` when the tree contains no nodes.
+    #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
     }
@@ -84,16 +95,17 @@ pub struct ReconcileResult {
 ///
 /// Two-pass O(N) algorithm:
 /// 1. Match keyed new nodes against keyed old nodes by key.
-/// 2. Match remaining unkeyed new nodes by position + type_tag.
+/// 2. Match remaining unkeyed new nodes by position + `type_tag`.
 ///
 /// Matched nodes get their `state` transferred from the old node.
 /// Unmatched new nodes keep `state: None`.
 /// Unmatched old nodes are dropped.
 ///
 /// This is a pure function with no side effects.
+#[must_use]
 pub fn reconcile(mut old: Vec<ViewNode>, new: Vec<ViewNode>) -> ReconcileResult {
     // Build index of keyed old nodes: key -> position in old vec.
-    let mut old_by_key: HashMap<NodeKey, usize> = HashMap::new();
+    let mut old_by_key: HashMap<NodeKey, usize> = HashMap::with_capacity(old.len());
     for (i, node) in old.iter().enumerate() {
         if let Some(ref key) = node.key {
             old_by_key.insert(key.clone(), i);
@@ -107,17 +119,19 @@ pub fn reconcile(mut old: Vec<ViewNode>, new: Vec<ViewNode>) -> ReconcileResult 
     // We collect which old index each new node matched, if any.
     let mut matched_old: Vec<Option<usize>> = Vec::with_capacity(new.len());
     for new_node in &new {
-        if let Some(ref key) = new_node.key {
-            if let Some(&old_idx) = old_by_key.get(key) {
-                if !old_consumed[old_idx] {
-                    old_consumed[old_idx] = true;
-                    matched_old.push(Some(old_idx));
-                    continue;
-                }
-            }
+        if let Some(ref key) = new_node.key
+            && let Some(&old_idx) = old_by_key.get(key)
+            && !old_consumed[old_idx]
+        {
+            old_consumed[old_idx] = true;
+            matched_old.push(Some(old_idx));
+            continue;
         }
         matched_old.push(None);
     }
+
+    debug_assert_eq!(matched_old.len(), new.len());
+    debug_assert!(old_by_key.len() <= old.len());
 
     // Pass 2: match remaining unkeyed nodes by position + type.
     // Build a list of unconsumed old nodes grouped by type for positional matching.
@@ -125,10 +139,7 @@ pub fn reconcile(mut old: Vec<ViewNode>, new: Vec<ViewNode>) -> ReconcileResult 
     let mut positional_queues: HashMap<TypeId, Vec<usize>> = HashMap::new();
     for (i, node) in old.iter().enumerate() {
         if !old_consumed[i] && node.key.is_none() {
-            positional_queues
-                .entry(node.type_tag)
-                .or_default()
-                .push(i);
+            positional_queues.entry(node.type_tag).or_default().push(i);
         }
     }
 
@@ -140,23 +151,27 @@ pub fn reconcile(mut old: Vec<ViewNode>, new: Vec<ViewNode>) -> ReconcileResult 
         if new_node.key.is_some() {
             continue; // keyed but no match found — stays unmatched
         }
-        if let Some(queue) = positional_queues.get_mut(&new_node.type_tag) {
-            if let Some(old_idx) = queue.first().copied() {
-                queue.remove(0);
-                old_consumed[old_idx] = true;
-                matched_old[new_idx] = Some(old_idx);
-            }
+        if let Some(queue) = positional_queues.get_mut(&new_node.type_tag)
+            && let Some(old_idx) = queue.first().copied()
+        {
+            queue.remove(0);
+            old_consumed[old_idx] = true;
+            matched_old[new_idx] = Some(old_idx);
         }
     }
 
     // Build result: transfer state from matched old nodes.
-    let mut result_nodes: Vec<ViewNode> = Vec::with_capacity(new.len());
+    let new_node_count = new.len();
+    let mut result_nodes: Vec<ViewNode> = Vec::with_capacity(new_node_count);
     for (new_idx, mut new_node) in new.into_iter().enumerate() {
         if let Some(old_idx) = matched_old[new_idx] {
             new_node.state = old[old_idx].state.take();
         }
         result_nodes.push(new_node);
     }
+
+    debug_assert_eq!(result_nodes.len(), matched_old.len());
+    debug_assert!(result_nodes.len() <= new_node_count);
 
     ReconcileResult {
         nodes: result_nodes,
@@ -165,38 +180,53 @@ pub fn reconcile(mut old: Vec<ViewNode>, new: Vec<ViewNode>) -> ReconcileResult 
 
 // ── Commit tracking ──────────────────────────────────────────────────────────
 
+/// Viewport information for [`compute_commits`].
+#[derive(Clone, Copy)]
+pub struct CommitViewport {
+    /// Height of the visible viewport in rows.
+    pub viewport_height: u16,
+    /// Number of rows scrolled above the viewport.
+    pub scroll_offset: u16,
+}
+
 /// Compute which nodes have been fully scrolled above the viewport.
 ///
-/// Given node heights and a viewport height, returns indices of nodes
+/// Given node heights and viewport information, returns indices of nodes
 /// whose rows are entirely above the visible region. Assumes nodes are
 /// stacked top-to-bottom starting from `scroll_offset`.
 ///
 /// This is a pure function — the backend supplies the actual viewport
 /// height from the terminal.
-pub fn compute_commits(
-    node_heights: &[u16],
-    viewport_height: u16,
-    scroll_offset: u16,
-) -> Vec<usize> {
+#[must_use]
+pub fn compute_commits(node_heights: &[u16], viewport: CommitViewport) -> Vec<u64> {
+    let CommitViewport {
+        viewport_height,
+        scroll_offset,
+    } = viewport;
     let total_height: u16 = node_heights.iter().copied().sum();
     if total_height <= viewport_height {
         return Vec::new();
     }
 
+    debug_assert!(total_height > viewport_height);
+
     // Nodes above the viewport are those whose bottom edge is at or
     // above the scroll offset. In scrollback mode, scroll_offset
     // represents how many rows have scrolled above the viewport.
-    let mut committed = Vec::new();
+    let mut committed = Vec::with_capacity(node_heights.len());
     let mut y = 0u16;
     for (i, &h) in node_heights.iter().enumerate() {
         let node_bottom = y.saturating_add(h);
         if node_bottom <= scroll_offset {
-            committed.push(i);
+            committed.push(i as u64);
         } else {
             break; // nodes are stacked, so once we're in the viewport, stop
         }
         y = node_bottom;
     }
+
+    debug_assert!(committed.len() <= node_heights.len());
+    debug_assert!(committed.windows(2).all(|window| window[0] < window[1]));
     committed
 }
 
@@ -206,7 +236,7 @@ pub fn compute_commits(
 mod tests {
     use super::*;
 
-    /// Helper: create a ViewNode with a given type tag and optional key.
+    /// Helper: create a `ViewNode` with a given type tag and optional key.
     fn node<T: 'static>(key: Option<&str>) -> ViewNode {
         ViewNode {
             key: key.map(|k| NodeKey(k.to_string())),
@@ -215,7 +245,7 @@ mod tests {
         }
     }
 
-    /// Helper: create a ViewNode with state.
+    /// Helper: create a `ViewNode` with state.
     fn node_with_state<T: 'static>(key: Option<&str>, state: u64) -> ViewNode {
         ViewNode {
             key: key.map(|k| NodeKey(k.to_string())),
@@ -236,10 +266,7 @@ mod tests {
             node_with_state::<TypeA>(Some("a"), 42),
             node_with_state::<TypeA>(Some("b"), 99),
         ];
-        let new = vec![
-            node::<TypeA>(Some("b")),
-            node::<TypeA>(Some("a")),
-        ];
+        let new = vec![node::<TypeA>(Some("b")), node::<TypeA>(Some("a"))];
 
         let result = reconcile(old, new);
         assert_eq!(result.nodes.len(), 2);
@@ -259,9 +286,7 @@ mod tests {
             node_with_state::<TypeA>(Some("a"), 1),
             node_with_state::<TypeA>(Some("b"), 2),
         ];
-        let new = vec![
-            node::<TypeA>(Some("a")),
-        ];
+        let new = vec![node::<TypeA>(Some("a"))];
 
         let result = reconcile(old, new);
         assert_eq!(result.nodes.len(), 1);
@@ -276,31 +301,34 @@ mod tests {
             node_with_state::<TypeA>(None, 10),
             node_with_state::<TypeB>(None, 20),
         ];
-        let new = vec![
-            node::<TypeA>(None),
-            node::<TypeB>(None),
-        ];
+        let new = vec![node::<TypeA>(None), node::<TypeB>(None)];
 
         let result = reconcile(old, new);
         assert_eq!(result.nodes.len(), 2);
         assert_eq!(
-            *result.nodes[0].state.as_ref().unwrap().downcast_ref::<u64>().unwrap(),
+            *result.nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
             10
         );
         assert_eq!(
-            *result.nodes[1].state.as_ref().unwrap().downcast_ref::<u64>().unwrap(),
+            *result.nodes[1]
+                .state
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
             20
         );
     }
 
     #[test]
     fn type_mismatch_at_position_creates_new_node() {
-        let old = vec![
-            node_with_state::<TypeA>(None, 10),
-        ];
-        let new = vec![
-            node::<TypeB>(None),
-        ];
+        let old = vec![node_with_state::<TypeA>(None, 10)];
+        let new = vec![node::<TypeB>(None)];
 
         let result = reconcile(old, new);
         assert_eq!(result.nodes.len(), 1);
@@ -310,19 +338,19 @@ mod tests {
 
     #[test]
     fn appended_node_gets_fresh_state() {
-        let old = vec![
-            node_with_state::<TypeA>(Some("a"), 42),
-        ];
-        let new = vec![
-            node::<TypeA>(Some("a")),
-            node::<TypeA>(Some("b")),
-        ];
+        let old = vec![node_with_state::<TypeA>(Some("a"), 42)];
+        let new = vec![node::<TypeA>(Some("a")), node::<TypeA>(Some("b"))];
 
         let result = reconcile(old, new);
         assert_eq!(result.nodes.len(), 2);
         // "a" preserves state.
         assert_eq!(
-            *result.nodes[0].state.as_ref().unwrap().downcast_ref::<u64>().unwrap(),
+            *result.nodes[0]
+                .state
+                .as_ref()
+                .unwrap()
+                .downcast_ref::<u64>()
+                .unwrap(),
             42
         );
         // "b" is new — no state.
@@ -331,14 +359,13 @@ mod tests {
 
     #[test]
     fn reconcile_is_deterministic() {
-        let mk_old = || vec![
-            node_with_state::<TypeA>(Some("x"), 7),
-            node_with_state::<TypeB>(None, 8),
-        ];
-        let mk_new = || vec![
-            node::<TypeB>(None),
-            node::<TypeA>(Some("x")),
-        ];
+        let mk_old = || {
+            vec![
+                node_with_state::<TypeA>(Some("x"), 7),
+                node_with_state::<TypeB>(None, 8),
+            ]
+        };
+        let mk_new = || vec![node::<TypeB>(None), node::<TypeA>(Some("x"))];
 
         let r1 = reconcile(mk_old(), mk_new());
         let r2 = reconcile(mk_old(), mk_new());
@@ -354,9 +381,7 @@ mod tests {
     #[test]
     fn empty_old_tree() {
         let old = vec![];
-        let new = vec![
-            node::<TypeA>(Some("a")),
-        ];
+        let new = vec![node::<TypeA>(Some("a"))];
 
         let result = reconcile(old, new);
         assert_eq!(result.nodes.len(), 1);
@@ -365,9 +390,7 @@ mod tests {
 
     #[test]
     fn empty_new_tree() {
-        let old = vec![
-            node_with_state::<TypeA>(Some("a"), 1),
-        ];
+        let old = vec![node_with_state::<TypeA>(Some("a"), 1)];
         let new = vec![];
 
         let result = reconcile(old, new);
@@ -376,10 +399,17 @@ mod tests {
 
     // ── Commit tracking tests ────────────────────────────────────────────
 
+    fn viewport(viewport_height: u16, scroll_offset: u16) -> CommitViewport {
+        CommitViewport {
+            viewport_height,
+            scroll_offset,
+        }
+    }
+
     #[test]
     fn no_commits_when_content_fits() {
         let heights = [5, 5, 5];
-        let commits = compute_commits(&heights, 20, 0);
+        let commits = compute_commits(&heights, viewport(20, 0));
         assert!(commits.is_empty());
     }
 
@@ -388,7 +418,7 @@ mod tests {
         // 4 nodes of 5 rows each = 20 total.
         // viewport = 10, scroll_offset = 10 means first 10 rows scrolled off.
         let heights = [5, 5, 5, 5];
-        let commits = compute_commits(&heights, 10, 10);
+        let commits = compute_commits(&heights, viewport(10, 10));
         assert_eq!(commits, vec![0, 1]);
     }
 
@@ -398,14 +428,14 @@ mod tests {
         // Node 0 bottom = 5 <= 7 → committed.
         // Node 1 bottom = 10 > 7 → not committed (partially visible).
         let heights = [5, 5, 5];
-        let commits = compute_commits(&heights, 8, 7);
+        let commits = compute_commits(&heights, viewport(8, 7));
         assert_eq!(commits, vec![0]);
     }
 
     #[test]
     fn no_commits_at_zero_scroll() {
         let heights = [5, 5, 5, 5];
-        let commits = compute_commits(&heights, 10, 0);
+        let commits = compute_commits(&heights, viewport(10, 0));
         assert!(commits.is_empty());
     }
 
@@ -413,14 +443,14 @@ mod tests {
     fn all_nodes_committed() {
         let heights = [3, 3, 3];
         // total = 9, viewport = 5, scroll_offset = 9 → all above viewport.
-        let commits = compute_commits(&heights, 5, 9);
+        let commits = compute_commits(&heights, viewport(5, 9));
         assert_eq!(commits, vec![0, 1, 2]);
     }
 
     #[test]
     fn empty_heights() {
         let heights: [u16; 0] = [];
-        let commits = compute_commits(&heights, 10, 0);
+        let commits = compute_commits(&heights, viewport(10, 0));
         assert!(commits.is_empty());
     }
 }
